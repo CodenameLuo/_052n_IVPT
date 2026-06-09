@@ -342,81 +342,371 @@ class PDiscoTrainer:
             self.epoch_test_accuracies = copy.deepcopy(snapshot.epoch_test_accuracies)
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
 
-    def _run_batch(self, source, targets, train: bool = True, vis_att_maps: bool = False, curr_iter: int = 0, vis_flag = None) -> \
-            Tuple[Any, Any]:
-        with torch.set_grad_enabled(train), torch.amp.autocast(device_type="cuda", dtype=torch.float16,
-                                                               enabled=self.use_amp):
+    def _run_batch(
+        self, 
+        source, 
+        targets, 
+        train: bool = True, 
+        vis_att_maps: bool = False, 
+        curr_iter: int = 0, 
+        vis_flag = None
+    ) -> Tuple[Any, Any]:
+        # torch.set_grad_enabled(train)：
+        # 训练时 True → 建反向图、之后能 .backward()
+        # 评估时 False → 不存中间量、省显存、也禁止误更新
+        # 一个开关同时管「训练/评估」两条路
+        # 
+        # torch.amp.autocast(fp16, enabled=use_amp)：
+        # 混合精度
+        # 开了之后，里面的矩阵乘/卷积自动用 float16 算（快、省显存）
+        # 数值敏感的（如 softmax/Norm 累加）仍留 float32
+        # enabled=use_amp → 配置不开就是普通 fp32
+        with torch.set_grad_enabled(train), torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_amp):
             all_features, dis_sim_maps, scores, maps_loss, (m_buffer, qm_buffer) = self.model(source) # (B, N+1, L) (B, P+1, N)
 
+            # ★可解释：outputs 是平均后的「集体决定」，但 scores 保留了每个部件投了谁（头投麻雀、翅投知更鸟）
             outputs = scores.mean(dim=-1)  # (batch_size, num_classes)
 
             if train:
+                # target = m_buffer[-1].detach()：
+                # 取 m_buffer 最后一条＝最深/最粗那层的粗空间图，detach 当固定老师
+                # 下面 consistency 让前面几层的粗图都去对齐它
                 target = m_buffer[-1].detach()
                 
                 # loss_consistency = 
                 
                 # Forward pass of transformed images
+                # 
+                # generate_affine_trans_params(...)：
+                # 随机生成一组仿射参数（转角 / 平移 / 缩放 / 切变），范围来自配置 eq_degrees 等
                 angle, translate, scale, shear = generate_affine_trans_params(
-                    degrees=self.eq_degrees, translate=self.eq_translate, scale_ranges=self.eq_scale_ranges,
-                    shears=self.eq_shear, img_size=[source.shape[2], source.shape[3]])
+                    degrees=self.eq_degrees, 
+                    translate=self.eq_translate, 
+                    scale_ranges=self.eq_scale_ranges, 
+                    shears=self.eq_shear, 
+                    img_size=[source.shape[2], 
+                    source.shape[3]]
+                )
+
                 # Apply the affine transform to the source image
-                source_transformed = rigid_transform(img=source, angle=angle,
-                                                     translate=translate,
-                                                     scale=scale,
-                                                     shear=0.0, invert=False)
+                # 
+                # 把原图做这套仿射 → source_transformed（转一下/缩一下的同一张图）
+                # 注意 shear=0.0 是写死的（生成了 shear 但应用时没用，细节）
+                source_transformed = rigid_transform(
+                    img=source, 
+                    angle=angle, 
+                    translate=translate, 
+                    scale=scale, 
+                    shear=0.0, 
+                    invert=False
+                )
+
+                # equiv_maps = self.model(source_transformed)[3]：
+                # 对变换后的图再跑一遍整个模型，只取第 4 个返回值 maps_loss（变换图的细分割图）
                 equiv_maps = self.model(source_transformed)[3] # TODO
+
+                # ============================================================
+
+                # ★这是 _run_batch 训练时模型跑两次的原因：
+                # 原图 1 次（拿分类 + 6 条正则）、变换图 1 次（只拿 equiv_maps 给 equivariance）
+                # 训练算力≈评估的 2 倍
+
+                # ============================================================
+
+                # ===========================
+                # 8 个 loss
+                # 
+                # 每个 loss 的讲法固定为：①管什么 → ②代码 → ③玩具手算 → ④把模型往哪推
+                # 权重 l_* 用仓库真实默认值
+                # （argument_parser_train.py）：
+                # 分类/presence/equiv/orth/tv/pixel-entropy 都 1.0，enforced_presence 2.0，consistency 无权重(=1.0)
+                # ===========================
+
+                # ===
+                # 分类 loss loss_classification —— 「类别猜得对不对」
+                # 
+                # ①管什么：标准多分类交叉熵，唯一直接盯「分类准确」的 loss，其余 7 条都在管部件图本身
+                # ②代码：self.loss_fn_train
+                # ③玩具手算：outputs=[1.060, 1.295]，真标签：知更鸟=1
+                #            softmax: p(知更鸟) = 1/(1+0.791) = 0.559
+                #            CE = -ln(0.559) = 0.582 × l_classification(1.0) = 0.582
+                # ④往哪推：把知更鸟那一类的概率往 1 推（拉大正确类 logit）
+                # ===
 
                 # Classification loss
                 loss_classification = self.loss_fn_train(outputs, targets) * self.l_classification
 
+                # ===
+                # 一致性 loss loss_consistency —— 「浅层粗图要像最深层粗图」（跨层 KL）
+                # 
+                # ①管什么：m_buffer[:-1]＝前几层（除最后一层）的粗空间图，
+                #          逐个对 target（最后一层、已 detach）算 KL 散度并平均
+                #          让不同深度对「同一个 patch 属于哪个粗部件」的判断一致
+                #          -> 部件语义跨层稳定（这是 IVPT「层级原型」的黏合剂）
+                #          注意它在总和里没有权重（隐含 1.0）
+                # ②代码：consistency_loss(pred,target) 内部：
+                #         Σ_通道 target·ln(target/pred)，
+                #         再对位置取平均（ KL(target‖pred)，把 pred 拉向 target ）
+                # ③玩具手算：m_buffer[:-1] = [注入f_maps] (pred)，
+                #             target = 收尾f_maps。给收尾层一个更尖的版本（深层更自信）：
+                # 
+                #          pred(注入, 浅)              target(收尾, 深, detach)
+                #         a     b     c     d            a     b     c     d
+                # 粗0   .777  .117  .016  .450         .90   .08   .01   .48
+                # 粗1   .205  .865  .020  .539         .08   .90   .01   .50
+                # bg    .018  .018  .965  .009         .02   .02   .98   .02
+                # 
+                # 逐位置 KL = Σ_通道 target·ln(target/pred):
+                # a: .90ln(.90/.777)+.08ln(.08/.205)+.02ln(.02/.018)= .1323-.0753+.0021=.0591
+                # b: .08ln(.08/.117)+.90ln(.90/.865)+.02ln(.02/.018)=-.0304+.0357+.0021=.0074
+                # c: .01ln(.01/.016)+.01ln(.01/.020)+.98ln(.98/.965)=-.0047-.0069+.0151=.0035
+                # d: .48ln(.48/.450)+.50ln(.50/.539)+.02ln(.02/.009)= .0310-.0376+.0160=.0094
+                # 
+                # 位置平均 = (.0591+.0074+.0035+.0094)/4 = 0.0199 ≈ 0.020
+                # 
+                # toy：len(m_buffer[:-1]) = 1
+                # 
+                # ④往哪推：把浅层那张图改得更像深层那张（a 处差最大、贡献 0.059）
+                #           KL(target‖pred) 每位置 ≥ 0
+                # ===
+
                 # Consistency loss
-                loss_consistency = sum([consistency_loss(maps_train, target) for maps_train in m_buffer[:-1]]) / len(m_buffer[:-1])
+                loss_consistency = sum(
+                    [
+                        consistency_loss(maps_train, target) for maps_train in m_buffer[:-1]
+                    ]
+                ) / len(m_buffer[:-1])
+
+                # ===
+                # 全变差 loss loss_tv —— 「分割图空间上要平滑（别噪点）」
+                # 
+                # ①管什么：对每张细分割图算 Total Variation＝相邻像素差的绝对值之和（含背景通道）
+                #           惩罚「东一块西一块」的碎片，逼部件成连通团块
+                # ②代码：TotalVariationLoss(reduction="mean")：纵向差 + 横向差，绝对值求和成 score，再 / (B·H·W)
+                # ③玩具手算：（对 3 通道全算，grid 2×2）：
+                # 
+                # 头 [[.982,    0],[.018, .495]]:  纵 |.018-.982|+|.495-0| + 横|0-.982|+|.495-.018| = 1.459 + 1.459
+                # 翅 [[   0, .982],[.018, .495]]:  纵    .018    +  .487   + 横  .982  +    .477    = 0.505 + 1.459
+                # bg [[.018, .018],[.965, .009]]:  纵    .947    +  .009   + 横    0   +    .956    = 0.956 + 0.956
+                # 
+                # score = (1.459+0.505+0.956) + (1.459+1.459+0.956) = 2.920 + 3.874 = 6.794
+                # 
+                # TV = 6.794 / (B·H·W=4) = 1.70 × l_tv(1.0) = 1.70
+                # 
+                # toy：len(maps_loss) = 1
+                # 
+                # ④往哪推：把跳变（如头通道 0→0.98 的硬边）磨平 → 部件区域更整片。
+                #           ⚠️ toy 例子值偏大正是因为 2×2 太尖
+                # ===
 
                 # Total variation loss
-                loss_tv = sum([self.total_variation_loss(maps) * self.l_tv for maps in maps_loss]) / len(maps_loss)
+                loss_tv = sum(
+                    [
+                        self.total_variation_loss(maps) * self.l_tv for maps in maps_loss
+                    ]
+                ) / len(maps_loss)
+
+                # ===
+                # 存在 loss loss_presence —— 「每个前景部件至少要在某处强烈出现」
+                # 
+                # ①管什么：maps[:, :-1] 丢掉背景、只留前景通道
+                #           presence_loss(默认 original) ＝ 1 − mean_部件( max_空间(本部件激活) )
+                #           逼每个前景部件在图里有个强响应点，防某部件「全程哑火」（退化坍缩）
+                # ②代码：original 内部：avg_pool2d(maps,3) 先 3×3 平滑 
+                #         → adaptive_max_pool2d(·,1) 取空间最大 
+                #         → 跨 batch 取 max → 部件间求均值 → 1 − 它
+                # ③玩具手算：⚠️ 3×3 平滑在 toy 2×2 上跑不动，当恒等处理
+                # 
+                # 头 空间 max = max(.982, 0, .018, .495) = .982
+                # 翅 空间 max = .982
+                # 部件均值 = (.982 + .982) / 2 = .982 → presence = 1 - .982 = 0.018 × l_presence(1.0) = 0.018
+                # 
+                # ④往哪推：值已很小＝头、翅各自都有强响应点（满足）
+                #           若某部件最大才 0.1，presence→0.9 重罚
+                #           与 enforced-presence 是一对：
+                #           presence 要前景「各有强峰」，enforced 要背景「占住边角」，合起来 = 部件又尖又不占满
+                # ===
 
                 # Presence loss (fg) for landmarks
-                loss_presence = sum([self.presence_loss(maps=maps[:, :-1, :, :]) * self.l_presence for maps in maps_loss]) / len(maps_loss)
+                loss_presence = sum(
+                    [
+                        self.presence_loss(maps=maps[:, :-1, :, :]) * self.l_presence for maps in maps_loss
+                    ]
+                ) / len(maps_loss)
+
+                # ===
+                # 正交 loss loss_orth —— 「不同部件的特征向量别趋同」
+                # 
+                # ①管什么：对 all_features [B,D,N+1]（含背景）按特征维归一化后两两算余弦，
+                #           减单位阵（自己对自己=1 不罚），平方求均值。
+                #           逼 N+1 个部件特征彼此正交（语义各管一摊），防多个部件学成同一个东西
+                # ②代码：normed = normalize(feat, dim=1)
+                #         G = normedᵀ·normed（余弦矩阵）
+                #         mean((G − I)²)
+                # ③玩具手算：（all_features 3 列：头=[1.74,.84] 翅=[.38,1.75] bg=[1,1]，bg 是占位）：
+                #              归一化: 头 → [.901,.435]  翅 → [.212,.977]  bg → [.707,.707]
+                #              余弦:   头·翅=.616   头·bg=.944   翅·bg=.841   (对角线减 1 → 0)
+                #              mean((G-I)²) = 2·(.616²+.944²+.841²)/9 = 2·(.379+.891+.707)/9 = 3.956/9 = 0.44 × l_orth(1.0) = 0.44
+                # 
+                # ④往哪推：头·bg 余弦 0.94 太高（头部件和背景太像）→ 正交 loss 主要在把这俩推开
+                #           头·翅 0.62 也偏高、一并压
+                # ===
 
                 # Orthogonality loss
                 loss_orth = orthogonality_loss(all_features) * self.l_orth
 
+                # ===
+                # 等变 loss loss_equiv —— 「图转了，找到的部件也跟着转」
+                # 
+                # ①管什么：用那张变换图的部件图 equiv_maps，
+                #           在 equivariance_loss 里把它反向变换回去（rigid_transform(invert=True)），
+                #           再和原图部件图 maps_loss 比余弦。
+                #           逼「先转图再找部件」≈「先找部件再转」 → 部件随物体几何一致地移动（不是死记图里固定坐标）
+                # ②代码：rot_back = 反变换(equiv_maps)
+                #         把前景通道拍平成向量；cos = cosine_similarity(orig, rot_back)；loss = 1 − mean(cos)
+                # ③玩具手算：（⚠️ toy 2×2 没法真旋转、模型也没训，数字仅示意）：
+                #              设头通道反变换回来 头'≈[.95,.02,.03,.45] vs 原 头=[.982,0,.018,.495]
+                # 
+                #              cos(头,头') = (.982·.95 + 0 + .018·.03 + .495·.45) / (‖头‖·‖头'‖) = 1.156 / (1.100·1.052) ≈ 0.999
+                #              两前景平均 cos ≈ 0.998 -> loss_equiv = 1 - 0.998 = 0.002 × l_equiv(1.0) = 0.002
+                # 
+                # ④往哪推：值小＝部件对几何变换稳定（满足）
+                #           不稳就大，逼模型学几何等变
+                #           这是唯一需要第 2 次前向的 loss
+                # ===
+
                 # Equivariance loss: calculate rotated landmarks distance
-                loss_equiv = sum([equivariance_loss(maps_loss[i], equiv_maps[i], source, self.num_landmarks, translate, angle, scale,
-                                               shear=0.0) * self.l_equiv for i in range(len(maps_loss))]) / len(maps_loss)
+                loss_equiv = sum(
+                    [
+                        equivariance_loss(maps_loss[i], equiv_maps[i], source, self.num_landmarks, translate, angle, scale, shear=0.0) * self.l_equiv for i in range(len(maps_loss))
+                    ]
+                ) / len(maps_loss)
+
+                # ===
+                # 强制存在 loss loss_enforced_presence —— 「背景部件要占住图像边角」
+                # 
+                # ①管什么：默认类型 enforced_presence（径向 mask 版）
+                #           造一张「中心=0、四角=1」的径向权重图，乘到背景通道上，取空间最大，BCE 推向 1。
+                #           逼背景部件在图像外围强烈存在 → 反过来把前景部件挤到中间、且不让前景吞掉边角。
+                #           权重 2.0（8 个里最重）
+                # ②代码：avg_pool2d(maps,3) → 乘径向 mask（中心 0 角落 1）
+                #         → 取背景通道 → adaptive_max_pool2d 空间最大 → BCE(·, 1)
+                # ③玩具手算：（⚠️ toy 2×2 上：3×3 平滑当恒等；径向 mask 在 2×2 退化＝四格全 1，因四格离中心等距）：
+                # 
+                #             背景通道 = [[.018,.018],[.965,.009]]，mask=1 → 空间 max = .965
+                #             BCE(.965, 目标1) = -ln(.965) = 0.0356 × l_enforced_presence(2.0) = 0.071
+                # 
+                # ④往哪推：背景在 c 处已达 .965（近满足）
+                #          真实 37×37 上 mask 把中心压 0、只认四角 
+                #           → 「背景必须长在画面边缘」才算数
+                # ===
 
                 # Enforced presence loss
-                loss_enforced_presence = sum([self.enforced_presence_loss(maps) * self.l_enforced_presence for maps in maps_loss]) / len(maps_loss)
+                loss_enforced_presence = sum(
+                    [
+                        self.enforced_presence_loss(maps) * self.l_enforced_presence for maps in maps_loss
+                    ]
+                ) / len(maps_loss)
+
+                # ===
+                # 逐像素熵 loss loss_pixel_wise_entropy —— 「每个 patch 要果断归一个部件」
+                # 
+                # ①管什么：把每个 patch 在「各部件通道」上的分布当类别分布，算熵，全图平均
+                #          熵低=分配尖锐（一个 patch 主要归一个部件）
+                #          逼软分割图别处处五五开、要果断
+                # ②代码：clamp + 重归一 -> Categorical(probs).entropy() 逐像素 -> mean
+                # ③玩具手算：（3 通道逐位置熵 −Σ p·ln p）：
+                # 
+                # a [.982,    0, .018]:  .982ln.982 + .018ln.018 = .0178 + .0723 = 0.090
+                # b [   0, .982, .018]:  对称                                    = 0.090
+                # c [.018, .018, .965]: 2·.0723 + .0344                          = 0.179
+                # d [.495, .495, .009]: 2·.348  + .0424                          = 0.738   ← 最高(就是那个五五开的 d!)
+                # 
+                # 平均 = (.090+.090+.179+.738)/4 = 0.274 × l_pixel_wise_entropy(1.0) = 0.274
+                # 
+                # ④往哪推：patch d（49.5/49.5 平手那个）熵最高 0.738，正是这条 loss 重点惩罚的对象
+                #          -> 逼 d 在头/翅里选一个
+                # ===
 
                 # Pixel-wise entropy loss
-                loss_pixel_wise_entropy = sum([pixel_wise_entropy_loss(maps) * self.l_pixel_wise_entropy for maps in maps_loss]) / len(maps_loss)
+                loss_pixel_wise_entropy = sum(
+                    [
+                        pixel_wise_entropy_loss(maps) * self.l_pixel_wise_entropy for maps in maps_loss
+                    ]
+                ) / len(maps_loss)
 
-                loss = loss_consistency + loss_presence + loss_classification + loss_orth + loss_equiv + loss_tv + loss_enforced_presence + loss_pixel_wise_entropy
+                # loss = 八项相加（已各自乘过权重）→ 一个标量
+                # 玩具：0.020+0.018+0.582+0.44+0.002+1.70+0.071+0.274 = 3.11
+                loss = loss_consistency + loss_presence + loss_classification    + loss_orth \
+                           + loss_equiv + loss_tv       + loss_enforced_presence + loss_pixel_wise_entropy
 
+                # zero_grad(set_to_none=True)：
+                # 清上一 batch 的梯度（置 None 比置 0 省显存/略快）
+                # 必须在 backward 前清，否则梯度会累加
                 self.optimizer.zero_grad(set_to_none=True)
+
                 if self.use_amp:
+                    # scaler.scale(loss).backward()：
+                    # 先把 loss 放大再反向（防 fp16 小梯度下溢成 0）
                     self.scaler.scale(loss).backward()
                     if self.grad_norm_clip:
+                        # clip_grad_norm_ 
+                        # 把总梯度范数截到 grad_norm_clip（默认 1.0，防爆炸）
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm_clip)
+
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
+                    # 反向
                     loss.backward()
                     if self.grad_norm_clip:
+                        # 裁剪
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm_clip)
+                    # 更新
                     self.optimizer.step()
 
-                losses_dict = {'loss_consistency': loss_consistency.item(),
-                               'loss_classification_train': loss_classification.item(),
-                               'loss_presence_train': loss_presence.item(),
-                               'loss_orth_train': loss_orth.item(),
-                               'loss_equiv_train': loss_equiv.item(),
-                               'loss_total_train': loss.item(), 'loss_tv': loss_tv.item(),
-                               'loss_enforced_presence': loss_enforced_presence.item(),
-                               'loss_pixel_wise_entropy': loss_pixel_wise_entropy.item()}
+                # 给 _run_epoch 打日志/求平均
+                # .item()：从 GPU 张量取出 Python float（脱离计算图，纯日志用）
+                # 8 个分项 + 1 个 loss_total_train 一起塞进字典
+                # 回到 _run_epoch 后用 AverageMeter 按样本数加权平均、每 log_freq 步打印
+                # （就是训练时刷屏的 Total/Classification/Consistency/...）
+                losses_dict = {
+                    'loss_consistency': loss_consistency.item(),
+                    'loss_classification_train': loss_classification.item(),
+                    'loss_presence_train': loss_presence.item(),
+                    'loss_orth_train': loss_orth.item(),
+                    'loss_equiv_train': loss_equiv.item(),
+                    'loss_total_train': loss.item(), 'loss_tv': loss_tv.item(),
+                    'loss_enforced_presence': loss_enforced_presence.item(),
+                    'loss_pixel_wise_entropy': loss_pixel_wise_entropy.item()
+                }
+            # （评估分支 train=False）只算 CE + 把 qm_buffer 整理成层级路由图
             else:
+                # loss = loss_fn_eval(outputs, targets)：
+                # 评估只算朴素交叉熵，那 7 条部件正则全不算、也不 backward（第 1 步 set_grad_enabled(False) 已禁梯度）
+                # 玩具：loss_total_val = 0.582
                 loss = self.loss_fn_eval(outputs, targets)
                 losses_dict = {'loss_total_val': loss.item()}
+
+                # ===
+                # 之后整理 qm_buffer（每层的细→粗路由 [B,P,N]）成 maps_multi，给「层级原型可视化」
+                # _run_epoch 里 relation_proto 那段用它统计「哪些细原型并进哪个粗部件」
+                # 
+                # maps[maps==0.1]=0：清掉「中性填充值」
+                # ⚠️ 注意 forward 里空原型填的是 1/N＝真实 N=4 时是 0.25、不是 0.1，
+                # 所以这行在当前配置几乎不触发 —— 像一处遗留常量（疑似只对 N=10 的旧配置生效），记一笔别依赖它
+                # 
+                # maps.mean(0)：跨 batch 平均 → [P,N]
+                # / sum(-1)：每个细原型那一行重归一成 1
+                # maps[isnan]=0：除零兜底
+                # 
+                # toy：
+                # qm_buffer=[[[.79,.21],[.12,.88]]] 
+                # → 无 0.1 → mean(batch=1) 不变 
+                # → 行已和 1 → maps_multi=[[[.79,.21],[.12,.88]]]
+                # （头主要进粗0、翅主要进粗1，正是层级结构）
+                # ===
+
                 maps_multi = []
                 for lay, maps in enumerate(qm_buffer):
                     maps[maps==0.1] = 0
@@ -425,6 +715,7 @@ class PDiscoTrainer:
                     maps[torch.isnan(maps)] = 0
                     maps_multi.append(maps)
 
+                # vis_att_maps：仅每 10 个 batch、且主进程，把分割图叠到原图上存盘
                 if vis_att_maps:
                     if vis_flag == None:
                         if curr_iter % 10 == 0 and is_main_process():
@@ -437,9 +728,15 @@ class PDiscoTrainer:
                                                         curr_iter=curr_iter, extra_info=lay, vis_flag=vis_flag)
 
         if train:
+            # 训练：outputs（给 _run_epoch 更新 top1/top5 准确率）+ losses_dict（日志）
             return outputs, losses_dict
         else:
+            # 评估（vis_flag 非 None，层级可视化的「第二趟重跑」）：
+            # 函数走到底隐式返回 None —— 那趟只为生成叠加图、不要返回值（_run_epoch 里那次调用确实没接收返回）
+            # 是有意的，不是漏写
+
             if vis_flag == None:
+                # 评估（vis_flag=None，正常评估）：多还一个 maps_multi（层级可视化用）
                 return outputs, losses_dict, maps_multi
         
 
