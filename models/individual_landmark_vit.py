@@ -732,6 +732,10 @@ class IndividualLandmarkViT(torch.nn.Module):
         f_maps = maps.flatten(2)
         m_buffer.append(f_maps)
 
+        # x_ = self.norm(x.detach())
+        # x_ = x_[:, self.num_prefix_tokens:, :]
+        # x_ = self.unflatten(x_)
+        # x_ = x_.permute(0, 3, 1, 2).contiguous()
         x = self.unflatten(self.norm(x_buffer[-1])[:, self.num_prefix_tokens:, :]).permute(0, 3, 1, 2).contiguous()
 
         # [2,768,5]
