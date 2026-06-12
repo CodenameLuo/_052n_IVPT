@@ -13,6 +13,23 @@ import os
 
 import Augmentor
 
+# Augmentor 的 rotate 在极端宽扁图（横宽比约 >=3.8:1）抽到 13~15 度时，
+# 旋转后裁"最大内接矩形"的公式会算出上下颠倒的裁剪框，PIL 抛 ValueError。
+# 角度在 perform_operation 内部随机抽取，捕获后重试即换角度；
+# 重试耗尽则放弃本次旋转返回原图（实际几乎不会走到）。
+_orig_rotate = Augmentor.Operations.RotateRange.perform_operation
+
+def _safe_rotate(self, images):
+    for _ in range(20):
+        try:
+            return _orig_rotate(self, images)
+        except ValueError:
+            continue
+    return images
+
+Augmentor.Operations.RotateRange.perform_operation = _safe_rotate
+
+
 def makedir(path):
     '''
     if path does not exist in the file system, create it
@@ -31,8 +48,10 @@ dir = os.path.join(datasets_root_dir, 'train_cropped/')
 target_dir = os.path.join(datasets_root_dir, 'train_cropped_augmented/')
 
 makedir(target_dir)
-folders = [os.path.join(dir, folder) for folder in next(os.walk(dir))[1]]
-target_folders = [os.path.join(target_dir, folder) for folder in next(os.walk(dir))[1]]
+folders = [os.path.abspath(os.path.join(dir, folder)) for folder in next(os.walk(dir))[1]]
+target_folders = [os.path.abspath(os.path.join(target_dir, folder)) for folder in next(os.walk(dir))[1]]
+# folders = [os.path.join(dir, folder) for folder in next(os.walk(dir))[1]]
+# target_folders = [os.path.join(target_dir, folder) for folder in next(os.walk(dir))[1]]
 
 for i in range(len(folders)):
     fd = folders[i]

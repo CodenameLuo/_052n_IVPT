@@ -1,0 +1,3 @@
+
+/root/autodl-tmp/_000n_00000000/_000n_uni/_001n_my_codes/_001n_projects/_005n_claude_code_projs/_001n_cc_translation/_010n_codes/_019n_IVPT/IVPT/scripts/my_scripts/run_train_1gpu.sh
+[Final] Full test set | Acc: 90.25% | Top5: 98.31% | Best: 91.21%
