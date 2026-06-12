@@ -30,7 +30,7 @@ _ext/
 *.pth
 *.pkl
 *.npy
-*.pt
+# *.pt
 
 # ---- Jupyter ----
 *.ipynb
