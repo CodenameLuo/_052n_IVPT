@@ -8,6 +8,23 @@ Reference:
     https://github.com/zxhuang1698/interpretability-by-parts/
 """
 
+# ======================================
+#
+# 这个文件定义“怎么把 CUB 数据集喂给模型”。本次训练只用到第一个类
+# FineGrainedBirdClassificationDataset：__init__ 读几个标注 txt 整理成一张表，
+# __getitem__ 按下标返回(增强后的图, 标签)。
+#
+# 第二个类 FineGrainedBirdClassificationParts 是带“部件关键点/检测框”的版本，
+# 只在“可解释性评估”里用，训练流程不碰它(下面有专门的提示横幅)。
+#
+# CUB 目录里几个关键 txt(空格分隔)：
+#   train_test_split.txt : <图id> <是否训练集(1/0)>
+#   images.txt           : <图id> <相对文件名>
+#   image_class_labels.txt: <图id> <类别标签>
+#   parts/part_locs.txt  : <图id> <部件id> <x> <y> <是否可见>
+#
+# ======================================
+
 import os
 from collections import defaultdict
 
@@ -16,7 +33,9 @@ import pandas as pd
 import PIL.Image
 import torch
 import torch.utils.data
+# pil_loader：读图并转 RGB；center_crop_boxes_kps：带关键点/框的中心裁剪(仅 Parts 类用)
 from utils.data_utils.dataset_utils import pil_loader, center_crop_boxes_kps
+# file_line_count：数文件行数(仅 Parts 类用来数关键点种类数)
 from utils.misc_utils import file_line_count
 
 
@@ -36,30 +55,43 @@ class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, data_path, split=1, mode='train', transform=None, image_sub_path="images"):
+        # 记下根目录、当前划分、增强、图片子目录
         self.data_path = data_path
         self.mode = mode
         self.transform = transform
         self.image_sub_path = image_sub_path
+        # 读图函数(打开 -> 转 RGB)
         self.loader = pil_loader
+        # === 读入四张标注表(都是空格分隔的 txt，用 pandas 读成 DataFrame) ===
+        # <图id, 是否训练集>
         train_test = pd.read_csv(os.path.join(data_path, 'train_test_split.txt'), sep='\s+',
                                  names=['id', 'train'])
+        # <图id, 文件名>
         image_names = pd.read_csv(os.path.join(data_path, 'images.txt'), sep='\s+',
                                   names=['id', 'filename'])
+        # <图id, 类别标签>
         labels = pd.read_csv(os.path.join(data_path, 'image_class_labels.txt'), sep='\s+',
                              names=['id', 'label'])
+        # <图id, 部件id, x, y, 是否可见>
         image_parts = pd.read_csv(os.path.join(data_path, 'parts', 'part_locs.txt'), sep='\s+',
                                   names=['id', 'part_id', 'x', 'y', 'visible'])
+        # 按图id 把“是否训练集 + 文件名 + 标签”拼成一张大表
         dataset = train_test.merge(image_names, on='id')
         dataset = dataset.merge(labels, on='id')
 
+        # === 按 mode 选出当前划分的样本 ===
         if mode == 'train':
+            # 只留官方训练集(train==1)，再取前 split 比例当训练(本次 split=1 即全部)
             dataset = dataset.loc[dataset['train'] == 1]
             samples_train = np.arange(len(dataset))
             self.train_samples = samples_train[:int(len(samples_train) * split)]
             dataset = dataset.iloc[self.train_samples]
         elif mode == 'test':
+            # 测试集：官方测试集(train==0)，固定不切分
             dataset = dataset.loc[dataset['train'] == 0]
         elif mode == 'val':
+            # 验证集：从官方训练集里取“后 (1-split) 比例”那部分(与 train 互补)
+            # 注：若 split=1，这里会切出空集——所以 split=1 时不要用 val 模式
             dataset = dataset.loc[dataset['train'] == 1]
             samples_val = np.arange(len(dataset))
             self.val_samples = samples_val[int(len(samples_val) * split):]
@@ -68,34 +100,49 @@ class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
 
         # training images are labelled 1, test images labelled 0. Add these
         # images to the list of image IDs
+        # 当前划分里所有图的 id 和 文件名(后面 __getitem__ 按下标取)
         self.ids = dataset['id'].to_numpy()
         self.names = dataset['filename'].to_numpy()
+        # === 标签重映射成 0 起、连续的整数 ===
+        # 原始标签可能不是从 0 开始、还可能有缺口；这里把它们压成 0,1,2,... 连续整数
+        # 例：原标签 [1, 2, 5, 10] -> labels_to_index={1:0, 2:1, 5:2, 10:3} -> self.labels 里存 0/1/2/3
         # Handle the case where the labels are not 0-indexed and there are gaps
         labels_to_array = dataset['label'].to_numpy()
         labels_to_index = {label: i for i, label in enumerate(np.unique(labels_to_array))}
         self.labels = np.array([labels_to_index[label] for label in labels_to_array])
+        # 反向映射：新下标 -> 原始标签(评估时想报告原始类别号时用)
         self.new_to_orig_label = {i: label for i, label in enumerate(np.unique(labels_to_array))}
+        # 部件标注：只留当前划分的图、且只保留“可见(visible==1)”的部件(仅评估时用到)
         image_parts = image_parts.loc[image_parts['id'].isin(self.ids)]
         self.parts = image_parts[image_parts['visible'] == 1]
+        # 类别总数(CUB=200)
         self.num_classes = len(np.unique(self.labels))
+        # 统计每个类有多少张图，存成 cls_num_list(类平衡采样/加权时会用到，本次默认不用)
         self.per_class_count = defaultdict(int)
         for label in self.labels:
             self.per_class_count[label] += 1
         self.cls_num_list = [self.per_class_count[idx] for idx in range(self.num_classes)]
 
+    # 数据集大小 = 样本数
     def __len__(self):
         return len(self.labels)
 
+    # 按下标取一条样本：返回(增强后的图张量, 标签整数)
     def __getitem__(self, idx):
+        # 拼出图片完整路径：根目录 / 图片子目录 / 文件名
         image_path = os.path.join(self.data_path, self.image_sub_path, self.names[idx])
+        # 读图(PIL，已转 RGB)
         im = self.loader(image_path)
+        # 取标签(已是 0 起连续整数)
         label = self.labels[idx]
 
+        # 过一遍增强流水线(训练=强增强，测试=弱增强) -> 得到 [3, H, W] 张量
         if self.transform:
             im = self.transform(im)
 
         return im, label
 
+    # —— 仅评估用：返回第 idx 张图里所有“可见”的部件 id —— 训练流程不调用
     def get_visible_parts(self, idx):
         """
         Returns all parts that are visible in the current image
@@ -109,6 +156,12 @@ class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
         return parts
 
 
+# ============================================================================
+# ↓↓↓ 以下 FineGrainedBirdClassificationParts 类【不在本次训练路径上】↓↓↓
+# 它是“部件发现/可解释性评估”专用的数据集：除了图和标签，还返回 15 个关键点标注和检测框，
+# 并在评估时按中心裁剪同步修正关键点/框坐标。bash scripts/run_train.sh 的训练流程完全不会用到它，
+# 故这里不逐行展开注释(保持原样)，等讲到评估步骤时再细看。
+# ============================================================================
 class FineGrainedBirdClassificationParts(torch.utils.data.Dataset):
     """
     Class for evaluating part detection/discovery on CUB200-2011 dataset. Also tested on NABirds.

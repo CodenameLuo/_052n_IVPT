@@ -4,6 +4,16 @@ Includes attention computation, attention rollout, SyncBN conversion,
 snapshot directory management, and small numerical helpers.
 """
 
+# ======================================
+#
+# 一个杂物抽屉。本次训练路径上真正用到的是文件末尾两个：
+#   sync_bn_conversion：多卡时把 BN 换成跨卡同步的 SyncBN(本次单卡，不会被调)；
+#   check_snapshot    ：train_net.py 第 3 步调用，建好存检查点的目录。
+# 另外 file_line_count 被(评估用的)Parts 数据集调用、factors 被可视化调用。
+# 中间一段 compute_attention / rollout / compute_* 是注意力可视化/分析用的，训练不碰(下面有横幅)。
+#
+# ======================================
+
 import math
 import os
 from functools import reduce
@@ -13,16 +23,24 @@ import numpy as np
 import torch
 
 
+# 求 n 的所有因子(可视化里用来把“patch 数”分解成接近正方形的网格行列数)
 def factors(n):
     return reduce(list.__add__,
                   ([i, n // i] for i in range(1, int(n ** 0.5) + 1) if n % i == 0))
 
 
+# 数文件行数(被评估用的 Parts 数据集用来数关键点种类数)
 def file_line_count(filename: str) -> int:
     """Count the number of lines in a file"""
     with open(filename, 'rb') as f:
         return sum(1 for _ in f)
 
+
+# ============================================================================
+# ↓↓↓ 以下 compute_attention / compute_dot_product_similarity / compute_cross_entropy / rollout
+# 都【不在本次训练路径上】↓↓↓ 它们是注意力图可视化、注意力 rollout、相似度/交叉熵等分析小工具，
+# 训练 forward 与 _run_batch 都不调用，这里保持原样、不逐行展开。
+# ============================================================================
 
 def compute_attention(qkv, scale=None):
     """
@@ -107,6 +125,12 @@ def rollout(attentions, discard_ratio=0.9, head_fusion="max", device=torch.devic
     return result
 
 
+# ============================================================================
+# ↓↓↓ 以下两个【在本次训练路径上】↓↓↓
+# ============================================================================
+
+# 多卡时把模型里所有 BatchNorm 换成跨卡同步版 SyncBatchNorm(让各卡共享统计量)
+# train_net.py 第 7 步：仅 use_ddp=True 才调；本次单卡不会进来
 def sync_bn_conversion(model: torch.nn.Module):
     """
     Convert BatchNorm to SyncBatchNorm (used for DDP)
@@ -118,6 +142,7 @@ def sync_bn_conversion(model: torch.nn.Module):
     return model
 
 
+# train_net.py 第 3 步：准备存检查点的目录
 def check_snapshot(args):
     """
     Create directory to save training checkpoints, otherwise load the existing checkpoint.
@@ -126,6 +151,7 @@ def check_snapshot(args):
     :return:
     """
     # Check if it is an array training job (i.e. training with multiple random seeds on the same settings)
+    # 多种子批量作业(本次 False)：给每个种子单独建一个子目录
     if args.array_training_job and not args.resume_training:
         args.snapshot_dir = os.path.join(args.snapshot_dir, str(args.seed))
         if not os.path.exists(args.snapshot_dir):
@@ -133,7 +159,10 @@ def check_snapshot(args):
             save_dir.mkdir(parents=True, exist_ok=True)
     else:
         # Create directory to save training checkpoints, otherwise load the existing checkpoint
+        # 普通情形【本次走这条】：目录不存在就建出来
         if not os.path.exists(args.snapshot_dir):
+            # 注：这里用 or 判断 .pt/.pth，逻辑有点绕——对普通目录路径(本次 ./snapshot)恒成立、直接建目录；
+            #     本意大概是“若路径像个检查点文件就报错(它本该已存在)”，但 or 写法对个别带 .pt 的路径会误判，本次不涉及
             if ".pt" not in args.snapshot_dir or ".pth" not in args.snapshot_dir:
                 save_dir = Path(args.snapshot_dir)
                 save_dir.mkdir(parents=True, exist_ok=True)

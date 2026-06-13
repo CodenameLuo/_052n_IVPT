@@ -5,18 +5,36 @@ Provides functions to load backbone architectures (ResNet, ConvNeXt, ViT),
 initialize the IVPT model, and load pre-trained checkpoints.
 """
 
+# ======================================
+#
+# 这个文件是“模型工厂”，train_net.py 第 6 步调用的 load_model_ivpt 就在这里。它分两步：
+#   1) load_model_arch：从 timm 把主干网络(本次=DINOv2 ViT-Base)建出来、加载预训练权重；
+#   2) init_ivpt_model：把这个主干用 IndividualLandmarkViT 包一层，在 ViT 里加上“部件发现”结构。
+# 包完返回的就是最终要训练的 IVPT 模型。
+#
+# 注：本文件后半段 ivpt_vit / ivptnet_vit / ivptnet_resnet101 是“从网上拉训练好的权重做推理”用的加载器，
+#     不在训练路径上(训练不会调它们)，下面有横幅标注。
+#
+# ======================================
+
 import copy
 import os
 from pathlib import Path
 
 import torch
+# timm 的建模入口(按模型名造网络、可选加载预训练权重)
 from timm.models import create_model
+# torchvision 的建模入口(仅 ResNet 用 torchvision 实现时才用)
 from torchvision.models import get_model
 
+# IndividualLandmarkViT：IVPT 的核心模型类；ivpt_vit_bb/ivptnet_vit_bb 是下面 hub 加载器用的(且为坏死代码)
 from models.individual_landmark_vit import IndividualLandmarkViT, ivpt_vit_bb, ivptnet_vit_bb
 from utils.training_utils.engine_utils import load_state_dict_ivpt
 
 
+# ======================================
+
+# 第 1 步：把主干网络建出来。按 model_arch 名字分派到 ResNet / ConvNeXt / ViT 三类；本次走 ViT('patch')分支
 def load_model_arch(args, num_cls):
     """
     Function to load the model
@@ -24,6 +42,7 @@ def load_model_arch(args, num_cls):
     :param num_cls: Number of classes in the dataset
     :return:
     """
+    # —— ResNet 分支(本次不走)：先从模型名里抠出层数，拼出对应的 timm 权重标签 ——
     if 'resnet' in args.model_arch:
         num_layers_split = [int(s) for s in args.model_arch if s.isdigit()]
         num_layers = int(''.join(map(str, num_layers_split)))
@@ -32,9 +51,11 @@ def load_model_arch(args, num_cls):
         else:
             timm_model_arch = args.model_arch + ".a1_in1k"
 
+    # ResNet + torchvision 实现(本次不走)
     if "resnet" in args.model_arch and args.use_torchvision_resnet_model:
         weights = "DEFAULT" if args.pretrained_start_weights else None
         base_model = get_model(args.model_arch, weights=weights)
+    # ResNet + timm 实现(本次不走)；注意：只有非 eval_only(即训练)时才加 drop_path
     elif "resnet" in args.model_arch and not args.use_torchvision_resnet_model:
         if args.eval_only:
             base_model = create_model(
@@ -52,6 +73,7 @@ def load_model_arch(args, num_cls):
                 output_stride=args.output_stride,
             )
 
+    # —— ConvNeXt 分支(本次不走) ——
     elif "convnext" in args.model_arch:
         if args.eval_only:
             base_model = create_model(
@@ -68,13 +90,16 @@ def load_model_arch(args, num_cls):
                 num_classes=num_cls,
                 output_stride=args.output_stride,
             )
+    # —— ViT 分支【本次走这条】：模型名里含 'patch'(如 vit_base_patch14_...) ——
     elif "patch" in args.model_arch:
+        # eval 时不加 drop_path
         if args.eval_only:
             base_model = create_model(
                 args.model_arch,
                 pretrained=args.pretrained_start_weights,
                 img_size=args.image_size,
             )
+        # 训练时加 drop_path(本次 drop_path=0，等于没加)；img_size=518 让 timm 重建匹配的位置编码
         else:
             base_model = create_model(
                 args.model_arch,
@@ -82,6 +107,7 @@ def load_model_arch(args, num_cls):
                 drop_path_rate=args.drop_path,
                 img_size=args.image_size,
             )
+        # 取出 patch 大小(本次 14)，检查图像尺寸能被整除(518/14=37，整除 OK)，否则切不出整数个 patch
         vit_patch_size = base_model.patch_embed.proj.kernel_size[0]
         if args.image_size % vit_patch_size != 0:
             raise ValueError(f"Image size {args.image_size} must be divisible by patch size {vit_patch_size}")
@@ -91,6 +117,9 @@ def load_model_arch(args, num_cls):
     return base_model
 
 
+# ======================================
+
+# 第 2 步：把主干包成 IVPT 模型，把所有 IVPT 专属超参(调制类型/gumbel/原型数 n_pro 等)透传进去
 def init_ivpt_model(base_model, args, num_cls):
     """
     Function to initialize the model
@@ -100,6 +129,7 @@ def init_ivpt_model(base_model, args, num_cls):
     :return:
     """
     # Initialize the network
+    # 本次是 ViT，用 IndividualLandmarkViT 包(把部件发现结构插进 ViT)
     if 'patch' in args.model_arch:
         model = IndividualLandmarkViT(base_model, num_classes=num_cls,
                                       part_dropout=args.part_dropout,
@@ -114,6 +144,9 @@ def init_ivpt_model(base_model, args, num_cls):
     return model
 
 
+# ======================================
+
+# 训练入口(train_net.py 第 6 步调用)：建主干 -> 包成 IVPT 模型 -> 返回
 def load_model_ivpt(args, num_cls):
     """
     Function to load the model
@@ -126,6 +159,14 @@ def load_model_ivpt(args, num_cls):
 
     return model
 
+
+# ============================================================================
+# ↓↓↓ 以下 ivpt_vit / ivptnet_vit / ivptnet_resnet101 都【不在本次训练路径上】↓↓↓
+# 它们是“从 torch.hub URL 下载训练好的检查点、组装好模型做推理/复现”的加载器，训练时不会被调用。
+# 而且它们依赖的 ivpt_vit_bb / ivptnet_vit_bb 是坏死代码(传了 IndividualLandmarkViT 并不接收的
+# num_landmarks / modulation_orth 参数)，ivptnet_resnet101 还引用了本文件没 import 的函数——真调用会报错。
+# 这里保持原样、不逐行展开。
+# ============================================================================
 
 def ivpt_vit(pretrained=True, model_dataset="cub", k=8, model_url="", img_size=224, num_cls=200):
     """

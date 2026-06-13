@@ -9,6 +9,20 @@ This guarantees:
     2. All samples are uniformly covered across consecutive epochs.
 """
 
+# ======================================
+#
+# 采样器(Sampler)决定“DataLoader 每个 epoch 按什么顺序、取哪些下标”。
+# 这里实现“每个 epoch 只用一部分数据”：把全集切成 ceil(1/fraction) 份(shard)，
+# 每个 epoch 只用其中一份、并随 epoch 轮换，凑满 ceil(1/fraction) 个 epoch 就正好把全集过一遍。
+#
+# 本次用途：eval_fraction=0.1 -> 训练中途的“评估 loader”用 EpochFractionSampler(单卡版)，
+#           每次中途评估只过 1/10 的测试集，省时间(最终评估仍用全量)。
+#           epoch_fraction=1.0，所以训练 loader 不用这个采样器。
+#
+# 两个类：EpochFractionDistributedSampler(多卡版，多一步“按卡再切分”)；EpochFractionSampler(单卡版，本次用)。
+#
+# ======================================
+
 import math
 from typing import Optional
 
@@ -17,6 +31,7 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, Sampler
 
 
+# 多卡版：在“按 epoch 取一份 shard”之外，还要把这份 shard 再均分给各张卡。本次单卡不走这里
 class EpochFractionDistributedSampler(Sampler):
     """DistributedSampler that only yields a fraction of the dataset per epoch.
 
@@ -42,6 +57,7 @@ class EpochFractionDistributedSampler(Sampler):
                  num_replicas: Optional[int] = None, rank: Optional[int] = None,
                  shuffle: bool = True, seed: int = 0,
                  drop_last: bool = False) -> None:
+        # 没给卡数/rank 就从分布式环境里取(非分布式则卡数=1、rank=0)
         if num_replicas is None:
             if dist.is_available() and dist.is_initialized():
                 num_replicas = dist.get_world_size()
@@ -53,6 +69,7 @@ class EpochFractionDistributedSampler(Sampler):
             else:
                 rank = 0
 
+        # fraction 必须在 (0,1] 内
         assert 0 < fraction <= 1.0, f"fraction must be in (0, 1], got {fraction}"
 
         self.dataset = dataset
@@ -64,13 +81,16 @@ class EpochFractionDistributedSampler(Sampler):
         self.drop_last = drop_last
         self.epoch = 0
 
+        # 要切成几份才能覆盖全集(如 fraction=0.1 -> 10 份)
         # Total number of shards needed to cover the full dataset
         self.num_shards = math.ceil(1.0 / fraction)
         self.total_dataset_size = len(dataset)
 
+        # 每份(shard)多少个样本
         # Samples per shard (before distributing across replicas)
         self.shard_size = math.ceil(self.total_dataset_size / self.num_shards)
 
+        # 每张卡每个 epoch 拿多少(把一份 shard 再均分给各卡)
         # Samples per replica per epoch
         if self.drop_last:
             self.num_samples = math.floor(self.shard_size / self.num_replicas)
@@ -79,6 +99,7 @@ class EpochFractionDistributedSampler(Sampler):
         self.total_size = self.num_samples * self.num_replicas
 
     def __iter__(self):
+        # 用 seed+epoch 做确定性打乱(同一 epoch 跨进程/跨运行得到一致顺序)
         # Deterministic shuffling based on epoch
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
@@ -88,17 +109,20 @@ class EpochFractionDistributedSampler(Sampler):
         else:
             indices = list(range(self.total_dataset_size))
 
+        # 选本 epoch 用哪一份 shard(随 epoch 轮换：epoch%份数)
         # Select the shard for this epoch (cycling)
         shard_id = self.epoch % self.num_shards
         start = shard_id * self.shard_size
         end = min(start + self.shard_size, self.total_dataset_size)
         indices = indices[start:end]
 
+        # 补齐到能被卡数整除(最后不够时用开头几个补上)
         # Pad to make evenly divisible by num_replicas
         if len(indices) < self.total_size:
             padding = self.total_size - len(indices)
             indices += indices[:padding]
 
+        # 按 rank 间隔取样，得到“分给本卡”的那部分
         # Subsample for this replica
         indices = indices[self.rank:self.total_size:self.num_replicas]
 
@@ -108,10 +132,12 @@ class EpochFractionDistributedSampler(Sampler):
     def __len__(self) -> int:
         return self.num_samples
 
+    # 训练/评估循环每个 epoch 调一次，更新 self.epoch -> 从而切到下一份 shard
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
 
+# 单卡版【本次走这个】：逻辑同上，但没有“按卡再切分/补齐”这一步
 class EpochFractionSampler(Sampler):
     """Single-GPU version of EpochFractionDistributedSampler."""
 
@@ -125,11 +151,13 @@ class EpochFractionSampler(Sampler):
         self.seed = seed
         self.epoch = 0
 
+        # 份数 / 全集大小 / 每份大小(fraction=0.1 -> 10 份，每份约 1/10)
         self.num_shards = math.ceil(1.0 / fraction)
         self.total_dataset_size = len(dataset)
         self.shard_size = math.ceil(self.total_dataset_size / self.num_shards)
 
     def __iter__(self):
+        # 同样用 seed+epoch 确定性打乱
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
 
@@ -138,6 +166,7 @@ class EpochFractionSampler(Sampler):
         else:
             indices = list(range(self.total_dataset_size))
 
+        # 取本 epoch 对应的那一份 shard(随 epoch 轮换)；这一份就是本次中途评估实际过的样本
         shard_id = self.epoch % self.num_shards
         start = shard_id * self.shard_size
         end = min(start + self.shard_size, self.total_dataset_size)
@@ -148,5 +177,6 @@ class EpochFractionSampler(Sampler):
     def __len__(self) -> int:
         return self.shard_size
 
+    # 更新 epoch -> 切到下一份 shard(由训练/评估循环调用)
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch

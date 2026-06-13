@@ -1,5 +1,15 @@
 """Dataset helper utilities (JSON I/O, image loading, bbox cropping)."""
 
+# ======================================
+#
+# 这个文件是一组数据相关的小工具。本次训练路径上真正用到的只有 pil_loader(读图并转 RGB)，
+# 它被上面的 Dataset.__getitem__ 调用。
+#
+# 其余函数(load_json/save_json、get_dimensions、center_crop_boxes_kps、_get_center_crop_params_)
+# 都是“带关键点/检测框的评估”才用的，训练不碰，下面只做概述、保持原样。
+#
+# ======================================
+
 import json
 from typing import List, Optional
 
@@ -9,6 +19,7 @@ from PIL import Image
 from torch import Tensor
 
 
+# —— 评估/日志用：读写 json —— 训练路径不用
 def load_json(path: str):
     """
     Load json file from path and return the data
@@ -32,6 +43,10 @@ def save_json(data: dict, path: str):
         json.dump(data, f)
 
 
+# ======================================
+
+# 【训练路径在用】读图：打开文件 -> 用 PIL 解码 -> 统一转成 RGB 三通道
+# 转 RGB 是为了兼容灰度图/带透明通道的图(灰度会复制成三通道)，保证后续张量都是 [3,H,W]
 def pil_loader(path):
     """
     Load image from path using PIL
@@ -43,6 +58,15 @@ def pil_loader(path):
         img = Image.open(f)
         return img.convert('RGB')
 
+
+# ============================================================================
+# ↓↓↓ 以下函数【不在本次训练路径上】↓↓↓
+# 都是“带部件关键点(parts)和检测框(boxes)的评估”才用的几何工具：
+#   get_dimensions          : 从 Tensor/ndarray/PIL 三种格式里取出 (高, 宽)
+#   center_crop_boxes_kps   : 对图做中心裁剪，并同步把关键点/框坐标平移、越界的标为不可见
+#   _get_center_crop_params_: 算中心裁剪的左上角偏移(含目标尺寸大于原图时的居中补边情形)
+# 训练时取图只过普通增强、不带关键点，所以这些都不会被调用，这里不逐行展开。
+# ============================================================================
 
 def get_dimensions(image: Tensor):
     """
