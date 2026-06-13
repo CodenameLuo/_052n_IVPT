@@ -23,10 +23,12 @@ SNAPSHOT_DIR="./snapshot"
 
 # ---------- Distributed ----------
 NUM_NODES=1
-NUM_GPUS=4       # number of GPUs on this machine
+# NUM_GPUS=4       # number of GPUs on this machine
+NUM_GPUS=1       # number of GPUs on this machine
 
 # ---------- Training ----------
-BATCH_SIZE=4          # per-GPU batch size
+# BATCH_SIZE=4          # per-GPU batch size
+BATCH_SIZE=12          # per-GPU batch size
 EPOCHS=25
 SAVE_EVERY=10
 NUM_WORKERS=4
@@ -36,7 +38,8 @@ EVAL_EVERY=5          # run eval every N epochs
 EVAL_FRACTION=0.1     # fraction of test data for periodic eval (final eval always uses full set)
 
 # ---------- Optimizer & Scheduler ----------
-LR=1e-6
+# LR=1e-6
+LR=0.866e-6
 OPTIMIZER="adam"
 SCHEDULER="steplr"
 SCHEDULER_GAMMA=0.5
