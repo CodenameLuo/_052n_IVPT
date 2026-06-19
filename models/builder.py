@@ -27,10 +27,11 @@ from timm.models import create_model
 # torchvision 的建模入口(仅 ResNet 用 torchvision 实现时才用)
 from torchvision.models import get_model
 
+# ======================================
+
 # IndividualLandmarkViT：IVPT 的核心模型类；ivpt_vit_bb/ivptnet_vit_bb 是下面 hub 加载器用的(且为坏死代码)
 from models.individual_landmark_vit import IndividualLandmarkViT, ivpt_vit_bb, ivptnet_vit_bb
 from utils.training_utils.engine_utils import load_state_dict_ivpt
-
 
 # ======================================
 
@@ -42,6 +43,7 @@ def load_model_arch(args, num_cls):
     :param num_cls: Number of classes in the dataset
     :return:
     """
+
     # —— ResNet 分支(本次不走)：先从模型名里抠出层数，拼出对应的 timm 权重标签 ——
     if 'resnet' in args.model_arch:
         num_layers_split = [int(s) for s in args.model_arch if s.isdigit()]
@@ -55,6 +57,7 @@ def load_model_arch(args, num_cls):
     if "resnet" in args.model_arch and args.use_torchvision_resnet_model:
         weights = "DEFAULT" if args.pretrained_start_weights else None
         base_model = get_model(args.model_arch, weights=weights)
+
     # ResNet + timm 实现(本次不走)；注意：只有非 eval_only(即训练)时才加 drop_path
     elif "resnet" in args.model_arch and not args.use_torchvision_resnet_model:
         if args.eval_only:
@@ -90,6 +93,7 @@ def load_model_arch(args, num_cls):
                 num_classes=num_cls,
                 output_stride=args.output_stride,
             )
+
     # —— ViT 分支【本次走这条】：模型名里含 'patch'(如 vit_base_patch14_...) ——
     elif "patch" in args.model_arch:
         # eval 时不加 drop_path
@@ -107,10 +111,12 @@ def load_model_arch(args, num_cls):
                 drop_path_rate=args.drop_path,
                 img_size=args.image_size,
             )
+
         # 取出 patch 大小(本次 14)，检查图像尺寸能被整除(518/14=37，整除 OK)，否则切不出整数个 patch
         vit_patch_size = base_model.patch_embed.proj.kernel_size[0]
-        if args.image_size % vit_patch_size != 0:
+        if (args.image_size % vit_patch_size) != 0:
             raise ValueError(f"Image size {args.image_size} must be divisible by patch size {vit_patch_size}")
+
     else:
         raise ValueError('Model not supported.')
 
@@ -131,13 +137,19 @@ def init_ivpt_model(base_model, args, num_cls):
     # Initialize the network
     # 本次是 ViT，用 IndividualLandmarkViT 包(把部件发现结构插进 ViT)
     if 'patch' in args.model_arch:
-        model = IndividualLandmarkViT(base_model, num_classes=num_cls,
-                                      part_dropout=args.part_dropout,
-                                      modulation_type=args.modulation_type, gumbel_softmax=args.gumbel_softmax,
-                                      gumbel_softmax_temperature=args.gumbel_softmax_temperature,
-                                      gumbel_softmax_hard=args.gumbel_softmax_hard,
-                                      classifier_type=args.classifier_type,
-                                      noise_variance=args.noise_variance, n_pro=args.n_pro)
+        model = IndividualLandmarkViT(
+            base_model, 
+            num_classes=num_cls, 
+            part_dropout=args.part_dropout, 
+            modulation_type=args.modulation_type, 
+            gumbel_softmax=args.gumbel_softmax, 
+            gumbel_softmax_temperature=args.gumbel_softmax_temperature, 
+            gumbel_softmax_hard=args.gumbel_softmax_hard, 
+            classifier_type=args.classifier_type, 
+            noise_variance=args.noise_variance, 
+            n_pro=args.n_pro
+        )
+
     else:
         raise ValueError('Model not supported.')
 

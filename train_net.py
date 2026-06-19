@@ -59,7 +59,6 @@ from engine.losses.builder import load_classification_loss, load_loss_hyper_para
 # 注：输入尺寸固定(本次图像统一 518×518)时能加速；若输入尺寸频繁变化反而会变慢
 torch.backends.cudnn.benchmark = True
 
-
 # ======================================
 
 def ivpt_train_eval():

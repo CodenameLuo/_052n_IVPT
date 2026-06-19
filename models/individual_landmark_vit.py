@@ -28,11 +28,14 @@ Reference:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from typing import Any, Union, Sequence
 
 from timm.models import create_model
 from timm.models.vision_transformer import Block, Attention
+
+# ======================================
 
 # compute_attention：从 qkv 复原注意力权重(仅分析方法用)
 from utils.misc_utils import compute_attention
@@ -40,57 +43,179 @@ from utils.misc_utils import compute_attention
 from .layers.transformer_layers import BlockWQKVReturn, AttentionWQKVReturn
 # 每部件独立 MLP 分类头(本次用 linear，不走它)
 from .layers.independent_mlp import IndependentMLPs
-import torch.nn.functional as F
 
+# ======================================
 
 class IndividualLandmarkViT(torch.nn.Module):
     # init_model：已建好的 timm ViT 主干；其余都是 IVPT 专属开关(由 builder.init_ivpt_model 透传)
     #   n_pro="17,14,11,8,5"、modulation_type="layer_norm"、gumbel_softmax=True、classifier_type="linear"
-    def __init__(self, init_model: torch.nn.Module, num_classes: int = 200,
-                 part_dropout: float = 0.3, return_transformer_qkv: bool = False,
-                 modulation_type: str = "original", gumbel_softmax: bool = False,
-                 gumbel_softmax_temperature: float = 1.0, gumbel_softmax_hard: bool = False,
-                 classifier_type: str = "linear", noise_variance: float = 0.0, n_pro: str = "") -> None:
+    def __init__(
+        self, 
+        init_model: torch.nn.Module, 
+        num_classes: int = 200, 
+        part_dropout: float = 0.3, 
+        return_transformer_qkv: bool = False, 
+        modulation_type: str = "original", 
+        gumbel_softmax: bool = False, 
+        gumbel_softmax_temperature: float = 1.0, 
+        gumbel_softmax_hard: bool = False, 
+        classifier_type: str = "linear", 
+        noise_variance: float = 0.0, 
+        n_pro: str = ""
+    ) -> None:
         super().__init__()
+
         # 把 "17,14,11,8,5" 解析成整数列表 [17,14,11,8,5]
         self.n_pro = [int(n) for n in n_pro.split(',')]
+
         # 前景部件数 = 最末位 - 1(本次 5-1=4)；那多出来的 1 个是“背景”槽
         self.num_landmarks = self.n_pro[-1] - 1 # num_landmarks
+
         self.num_classes = num_classes
+
         # 给特征加高斯噪声的方差(本次 0，不加)
         self.noise_variance = noise_variance
-        # 主干的前缀 token 数(cls + register)：DINOv2 reg4 是 1+4=5，它们不算 patch、聚特征时要先剔掉
+
+        # ======================================
+        # 复制主干 ViT 的“前缀 token / 位置编码布局”元信息
+        #
+        # ViT 送进 Transformer 的序列不一定只有图像 patch token，最前面还可能插入：
+        #   1) cls token：汇总整张图的全局信息；
+        #   2) register token：额外的可学习全局槽位，用来吸收/整理信息，不对应具体图像位置。
+        # 本次主干 vit_base_patch14_reg4_dinov2：
+        #   [CLS 1个] + [REGISTER 4个] + [PATCH 37×37=1369个]
+        #   -> Transformer 输入序列形状为 [B, 5+1369, 768] = [B, 1374, 768]
+        # 前 5 个 token 没有 H×W 空间位置，不能 reshape 成 patch 特征图；算部件图前必须切掉。
+        # ======================================
+
+        # 前缀 token 总数 = cls token 数 + register token 数
+        # timm 中的计算方式：num_prefix_tokens = (1 if class_token else 0) + reg_tokens
+        # 本次值为 5；后面用 x[:, self.num_prefix_tokens:, :] 统一剔除前 5 个非 patch token
         self.num_prefix_tokens = init_model.num_prefix_tokens
+
+        # register token 的数量；本次 reg4 模型值为 4
+        # 它主要用于保留主干结构元信息；本文件不单独切 register，而是通过 num_prefix_tokens 连同 CLS 一起切掉
         self.num_reg_tokens = init_model.num_reg_tokens
+
+        # 主干是否包含 cls token；本次为 True，所以序列第 0 个 token 是 CLS
+        # 注意：这个布尔值只描述“有没有 CLS”，不要与下面 no_embed_class 混淆
         self.has_class_token = init_model.has_class_token
+
+        # 控制“位置编码是否包含前缀 token 的位置”，并不表示没有 class token
+        # 本次 DINOv2 reg4 为 True：pos_embed 只含 1369 个 patch 位置，形状 [1,1369,768]；
+        # _pos_embed 中会先给 patch 加位置编码，再把 CLS/register 拼到序列最前面
+        # 若为 False：pos_embed 自身还包含前缀位置，应先拼前缀 token，再给完整序列加位置编码
         self.no_embed_class = init_model.no_embed_class
+
         # 直接复用主干的 cls_token / reg_token(共享参数)
         self.cls_token = init_model.cls_token
         self.reg_token = init_model.reg_token
+
         # 注入原型的层数 = 列表长度-1(本次 4)：在最后 4 个 block 注入
         self.layer_n = len(self.n_pro) - 1
+
         self.gumbel_softmax = gumbel_softmax
 
-        # === 直接“借用”主干的各个零件(patch 嵌入、位置编码、blocks、归一化等)，不另起炉灶 ===
-        self.feature_dim = init_model.embed_dim          # 特征维 D(ViT-Base=768)
-        self.patch_embed = init_model.patch_embed        # 把图切 patch 并线性嵌入
-        self.pos_embed = init_model.pos_embed            # 位置编码
+        # ======================================
+        # 直接复用预训练主干的核心组件，不重新创建另一套 ViT
+        #
+        # 这里的赋值不是复制一份参数，而是让 IndividualLandmarkViT 持有 init_model 中同一批模块/参数对象；
+        # 因此后面的 forward 仍然使用 DINOv2 预训练好的 patch 嵌入、位置编码、Transformer blocks 和归一化层。
+        # IVPT 在这套主干外新增原型/部件模块，并在最后几个 block 周围插入自己的计算逻辑。
+        # ======================================
+
+        # 每个 token 的特征维度 D；本次 ViT-Base 的 embed_dim=768
+        # 后续原型 token、部件特征、投影层和分类头都必须使用相同的 768 维，才能与主干 token 交互
+        self.feature_dim = init_model.embed_dim
+
+        # PatchEmbed：把输入图片切成不重叠 patch，并把每个 patch 投影成 D 维 token
+        # 本次内部用 kernel_size=stride=14 的 Conv2d 实现：
+        # [B,3,518,518] -> 37×37 个 patch -> [B,1369,768]
+        self.patch_embed = init_model.patch_embed
+
+        # 可学习的位置编码，为每个 patch token 注入其二维位置身份
+        # 本次 no_embed_class=True，所以它只覆盖 1369 个 patch，形状为 [1,1369,768]，不含 CLS/register 的位置
+        # _pos_embed() 会把它加到 patch token 上，再拼接前缀 token
+        self.pos_embed = init_model.pos_embed
+
+        # 位置编码和前缀 token 拼接完成后的 Dropout，_pos_embed() 的最后一步会调用它
+        # 本次虽然模块类型是 Dropout，但 p=0.0，实际不会丢弃任何 token 特征
         self.pos_drop = init_model.pos_drop
+
+        # 进入 Transformer blocks 之前的预归一化层
+        # 本次 DINOv2 主干中它是 Identity，即不做任何变换；分析辅助路径会调用，主 forward 中该行被注释掉
         self.norm_pre = init_model.norm_pre
-        self.blocks = init_model.blocks                  # ViT 的 Transformer block 列表(ViT-Base 共 12 个)
-        self.norm = init_model.norm                      # 主干最后的 LayerNorm
+
+        # 预训练 ViT 的 Transformer Block 序列；本次 ViT-Base 共 12 个 block
+        # forward 中前 8 个 block 原样运行，最后 4 个 block 会加入 IVPT 原型/部件 token 后再运行
+        # 后续 convert_blocks_and_attention() 只替换其类以支持返回 qkv，不重新初始化或丢弃预训练权重
+        self.blocks = init_model.blocks
+
+        # 主干输出端的最终 LayerNorm，对 block 输出的每个 token 特征做归一化
+        # IVPT 多次用它规范 patch 特征，再剔除前缀 token、reshape 成 37×37 特征图并计算部件图
+        self.norm = init_model.norm
+
+        # 是否让替换后的 Transformer block 额外返回 q/k/v，供注意力分析和中间层接口使用
+        # 本次默认 False：普通训练 forward 只消费 token 输出，不额外收集 qkv
         self.return_transformer_qkv = return_transformer_qkv
+
         # patch 网格的高/宽 = 图边长 // patch 边长(本次 518//14 = 37)，即 37×37 个 patch
         self.h_fmap = int(self.patch_embed.img_size[0] // self.patch_embed.patch_size[0])
         self.w_fmap = int(self.patch_embed.img_size[1] // self.patch_embed.patch_size[1])
 
         # === IVPT 新增的可学习组件(只有这些 + 分类头 + 各 norm 会被训练，主干冻结) ===
-        # p_token[i]：第 i 个注入位点的原型 token，形状 [1, n_pro[i], D]；共 layer_n+1=5 组
-        # (前 4 组在 block 循环里注入，最后第 5 组(index -1)在循环结束后用于最终读出)
-        self.p_token = nn.ParameterList([nn.Parameter(torch.zeros(1, self.n_pro[i], init_model.cls_token.shape[-1])) for i in range(self.layer_n+1)])
-        # 原型初始化为小高斯(std=0.05)
+
+        # ======================================
+        # 创建 5 组可学习的视觉原型向量 p_token
+        #
+        # 每个原型都是一个 D=768 维向量，与主干 patch 特征处在同一个特征空间；
+        # forward 中通过 compute_xq() 计算“每个原型与每个 patch 特征的负平方 L2 距离”，
+        # 从而得到原型的空间响应图：某个 patch 越接近某个原型，该原型在该位置的响应越强。
+        #
+        # 注意：p_token 本身不会直接拼进 Transformer 序列。前 4 组原型先生成空间图，
+        # 再根据空间图从 patch 特征中聚合出 q_x 部件 token，真正拼回序列的是 q_x。
+        # 最后第 5 组原型只用于最终部件图与分类读出，不再拼回 block。
+        # ======================================
+
+        # nn.ParameterList：保存长度不同的多组可训练参数，并让 PyTorch 自动完成：
+        #   1) 在 model.parameters() / named_parameters() 中登记；
+        #   2) 随 model.to(device) 搬到 GPU；
+        #   3) 写入 state_dict/checkpoint；
+        #   4) 接收梯度并由优化器更新。
+        # 普通 Python list 无法自动提供这些参数注册能力。
+        #
+        # range(self.layer_n + 1)：本次 layer_n=4，所以创建 i=0,1,2,3,4 共 5 组；
+        # self.n_pro=[17,14,11,8,5]，init_model.cls_token.shape[-1]=D=768，因此各组形状为：
+        #   p_token[0]: [1,17,768]，用于 block 8 前的第 1 个原型注入位点；
+        #   p_token[1]: [1,14,768]，用于 block 9 前的第 2 个原型注入位点；
+        #   p_token[2]: [1,11,768]，用于 block 10 前的第 3 个原型注入位点；
+        #   p_token[3]: [1, 8,768]，用于 block 11 前的第 4 个原型注入位点；
+        #   p_token[4]: [1, 5,768]，用于循环结束后的最终读出，其中 5=4 个前景部件+1 个背景槽。
+        # 五组共 17+14+11+8+5=55 个原型向量，即 55×768=42240 个可学习标量参数。
+        #
+        # 首维为什么写成 1：模型只保存并学习一套跨图片共享的原型参数，而不是为每张图保存独立原型。
+        # 例：p_token[0] 的真实可学习参数始终只有 [1,17,768]；所有训练图片共同使用并更新这 17 个原型。
+        # 这与卷积核类似：batch 中每张图都会使用同一组卷积核，但不会各自拥有一套卷积核参数。
+        #
+        # forward 中的 expand(B,-1,-1) 只在计算时把共享参数广播成 [B,n_pro[i],768] 的逻辑视图，
+        # 方便 batch 中每张图并行与同一套原型计算距离；expand 不复制数据，也不会创建 B 套独立参数。
+        # 每张图因 patch 特征不同会产生不同响应图；反向传播时，各图对原型的梯度会汇总回唯一的
+        # [1,n_pro[i],768] 参数，再由 optimizer.step() 更新这一套共享原型。
+        self.p_token = nn.ParameterList(
+            [
+                # 先创建全零张量，再包装为可训练参数；下面的 normal_ 会立刻覆盖这些零值
+                nn.Parameter(
+                    torch.zeros(1, self.n_pro[i], init_model.cls_token.shape[-1])
+                ) for i in range(self.layer_n+1)
+            ]
+        )
+
+        # 用均值 0、标准差 0.05 的高斯分布独立初始化每组原型
+        # 随机小值用于打破原型之间的对称性；若所有原型一直从完全相同的零向量开始，容易学成相同响应
+        # p_token 在优化器中属于 finer 参数组：本次始终训练，学习率=基准 lr×2e2，weight_decay=0
         for i, p in enumerate(self.p_token):
             nn.init.normal_(p, std=0.05)
+
         # p_bias[i]：可学习的“空间偏置”，形状 [1, n_pro[i], H, W]；加到距离图上再 softmax，
         #   相当于给每个原型一个“倾向于关注图里哪块位置”的先验
         self.p_bias = nn.ParameterList([nn.Parameter(torch.zeros(1, self.n_pro[i], self.h_fmap, self.w_fmap)) for i in range(self.layer_n+1)])
@@ -247,6 +372,9 @@ class IndividualLandmarkViT(torch.nn.Module):
             else:
                 x = x[:, :x_len]                       # 把上一轮末尾拼进来的部件 token 切掉，只留前缀+patch
                 q_index = i - l + self.layer_n         # 当前注入位点序号 0/1/2/3
+                # 取当前位点唯一的一套共享原型 [1,n_pro[q_index],D]，沿 batch 维广播成 [B,n_pro[q_index],D]
+                # expand 不复制参数：所有 q[b] 都引用同一个 p_token[q_index]；每张图只会产生不同的响应图
+                # 反向传播时，各 batch 样本对 q[b] 的梯度会沿广播维汇总到同一个 p_token[q_index].grad
                 q = self.p_token[q_index].expand(x.shape[0], -1, -1) # 取该位点原型 [B, n_pro[i], D] # + q_pre.detach()
                 x_buffer.append(x)                     # 存下当前特征(供第③段统一再算一遍图)
                 q_buffer.append(q)
@@ -305,6 +433,8 @@ class IndividualLandmarkViT(torch.nn.Module):
                 x = block(x)                            # 带着部件 token 一起过这个 block
 
         # === 第③段：最终读出 —— 用第 5 组原型 + 各位点缓存，统一再算一遍部件图，并分类 ===
+        # 最终读出同样使用一套共享的 p_token[-1]：[1,5,D] 仅广播成 [B,5,D] 参与计算，不生成独立参数
+        # 各图片通过最终部件图产生的梯度仍会共同汇总到唯一的 p_token[-1].grad
         q = self.p_token[-1].expand(x.shape[0], -1, -1)   # 最后一组原型 [B, 5, D](5=N+1)
         x = x[:, :x_len]                                  # 切掉末尾部件 token
         x_buffer.append(x)                                # 此时 x_buffer/q_buffer 各 5 项(4 注入位点 + 这个最终位点)

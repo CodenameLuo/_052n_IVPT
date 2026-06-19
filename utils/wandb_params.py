@@ -43,8 +43,10 @@ def init_wandb(args):
 # train_net.py 第 2 步调用：开了 --wandb 才把一份(深拷贝的)配置塞进列表返回；否则返回空列表
 def get_train_loggers(args):
     """Get the train loggers for the experiment"""
+
     train_loggers = []
     if args.wandb:
         wandb_logger_settings = copy.deepcopy(vars(args))
         train_loggers.append(wandb_logger_settings)
+
     return train_loggers

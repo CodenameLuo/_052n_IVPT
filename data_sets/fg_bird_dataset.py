@@ -27,17 +27,20 @@ Reference:
 
 import os
 from collections import defaultdict
-
 import numpy as np
 import pandas as pd
 import PIL.Image
 import torch
 import torch.utils.data
+
+# ======================================
+
 # pil_loader：读图并转 RGB；center_crop_boxes_kps：带关键点/框的中心裁剪(仅 Parts 类用)
 from utils.data_utils.dataset_utils import pil_loader, center_crop_boxes_kps
 # file_line_count：数文件行数(仅 Parts 类用来数关键点种类数)
 from utils.misc_utils import file_line_count
 
+# ======================================
 
 class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
     """
@@ -54,7 +57,14 @@ class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
         image_sub_path, str: Path to the folder containing the images.
     """
 
-    def __init__(self, data_path, split=1, mode='train', transform=None, image_sub_path="images"):
+    def __init__(
+        self, 
+        data_path, 
+        split=1, 
+        mode='train', 
+        transform=None, 
+        image_sub_path="images"
+    ):
         # 记下根目录、当前划分、增强、图片子目录
         self.data_path = data_path
         self.mode = mode
@@ -62,29 +72,63 @@ class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
         self.image_sub_path = image_sub_path
         # 读图函数(打开 -> 转 RGB)
         self.loader = pil_loader
+
         # === 读入四张标注表(都是空格分隔的 txt，用 pandas 读成 DataFrame) ===
         # <图id, 是否训练集>
-        train_test = pd.read_csv(os.path.join(data_path, 'train_test_split.txt'), sep='\s+',
-                                 names=['id', 'train'])
+        train_test = pd.read_csv(
+            os.path.join(data_path, 'train_test_split.txt'), 
+            sep='\s+', 
+            names=['id', 'train']
+        )
         # <图id, 文件名>
-        image_names = pd.read_csv(os.path.join(data_path, 'images.txt'), sep='\s+',
-                                  names=['id', 'filename'])
+        image_names = pd.read_csv(
+            os.path.join(data_path, 'images.txt'), 
+            sep='\s+', 
+            names=['id', 'filename']
+        )
         # <图id, 类别标签>
-        labels = pd.read_csv(os.path.join(data_path, 'image_class_labels.txt'), sep='\s+',
-                             names=['id', 'label'])
+        labels = pd.read_csv(
+            os.path.join(data_path, 'image_class_labels.txt'), 
+            sep='\s+', 
+            names=['id', 'label']
+        )
         # <图id, 部件id, x, y, 是否可见>
-        image_parts = pd.read_csv(os.path.join(data_path, 'parts', 'part_locs.txt'), sep='\s+',
-                                  names=['id', 'part_id', 'x', 'y', 'visible'])
+        image_parts = pd.read_csv(
+            os.path.join(data_path, 'parts', 'part_locs.txt'), 
+            sep='\s+', 
+            names=['id', 'part_id', 'x', 'y', 'visible']
+        )
+
         # 按图id 把“是否训练集 + 文件名 + 标签”拼成一张大表
         dataset = train_test.merge(image_names, on='id')
         dataset = dataset.merge(labels, on='id')
 
-        # === 按 mode 选出当前划分的样本 ===
+        # ======================================
+        # 根据 mode，从上面的完整样本表中选出当前 Dataset 对象实际使用的样本
+        # mode='train'：从官方训练集里取前 split 比例
+        # mode='val'  ：从官方训练集里取剩余的后 (1-split) 比例
+        # mode='test' ：直接使用完整的官方测试集
+        # ======================================
         if mode == 'train':
-            # 只留官方训练集(train==1)，再取前 split 比例当训练(本次 split=1 即全部)
+            # dataset['train'] == 1：逐行判断是否属于官方训练集，得到一列 True / False 布尔值
+            # dataset.loc[...]：只保留结果为 True 的行
+            # CUB 完整数据有 11788 张图；筛选后只剩 5994 张官方训练图
             dataset = dataset.loc[dataset['train'] == 1]
+
+            # 为筛选后的官方训练集生成从 0 开始的连续“行位置编号”
+            # 注意：这些数字不是图片 id，也不是 pandas 原索引，只表示当前 dataset 中第几行
+            # 例：len(dataset)=5994 -> samples_train=array([0, 1, 2, ..., 5993])
             samples_train = np.arange(len(dataset))
+
+            # 根据 split 计算实际训练样本数量，并取前 split 比例的行位置
+            # int() 会直接舍弃小数部分
+            # 例：split=1   -> int(5994 * 1)=5994，使用全部官方训练图
+            # 例：split=0.8 -> int(5994 * 0.8)=4795，使用前 4795 张图
             self.train_samples = samples_train[:int(len(samples_train) * split)]
+
+            # iloc 按“整数位置”选行，用上面的位置编号截出实际训练集
+            # 本次 split=1，所以 dataset 仍包含全部 5994 张官方训练图
+            # 注意：这里没有随机打乱或按类别分层；split<1 时只是按当前顺序取前一部分样本
             dataset = dataset.iloc[self.train_samples]
         elif mode == 'test':
             # 测试集：官方测试集(train==0)，固定不切分
@@ -103,43 +147,111 @@ class FineGrainedBirdClassificationDataset(torch.utils.data.Dataset):
         # 当前划分里所有图的 id 和 文件名(后面 __getitem__ 按下标取)
         self.ids = dataset['id'].to_numpy()
         self.names = dataset['filename'].to_numpy()
-        # === 标签重映射成 0 起、连续的整数 ===
-        # 原始标签可能不是从 0 开始、还可能有缺口；这里把它们压成 0,1,2,... 连续整数
-        # 例：原标签 [1, 2, 5, 10] -> labels_to_index={1:0, 2:1, 5:2, 10:3} -> self.labels 里存 0/1/2/3
+
+        # ======================================
+        # 把当前划分的原始类别标签，重映射成从 0 开始、没有缺口的连续整数
+        # 分类模型通常要求标签能直接作为类别下标使用，所以最终标签应为 0, 1, ..., num_classes-1
+        # ======================================
+
+        # 从当前划分的 DataFrame 中取出 label 列，并转成一维 numpy 数组
+        # CUB 原始类别标签从 1 开始；本次 train/test 划分各自都包含 200 类
+        # 例：train 模式下 labels_to_array.shape=(5994,)，内容类似 [1, 1, ..., 200, 200]
         # Handle the case where the labels are not 0-indexed and there are gaps
         labels_to_array = dataset['label'].to_numpy()
-        labels_to_index = {label: i for i, label in enumerate(np.unique(labels_to_array))}
-        self.labels = np.array([labels_to_index[label] for label in labels_to_array])
-        # 反向映射：新下标 -> 原始标签(评估时想报告原始类别号时用)
-        self.new_to_orig_label = {i: label for i, label in enumerate(np.unique(labels_to_array))}
-        # 部件标注：只留当前划分的图、且只保留“可见(visible==1)”的部件(仅评估时用到)
+
+        # np.unique：取出当前划分中不重复的原始标签，并按从小到大排序
+        # enumerate：为排序后的每个原始标签分配一个从 0 开始的新类别下标
+        # 例：原始标签集合 [1, 2, 5, 10] -> labels_to_index={1:0, 2:1, 5:2, 10:3}
+        # CUB 当前划分：{1:0, 2:1, ..., 200:199}
+        labels_to_index = {
+            label: i for i, label in enumerate(np.unique(labels_to_array))
+        }
+
+        # 逐个查表，把每张图的原始标签转换成连续的新标签；结果顺序与 dataset 的图片行顺序完全一致
+        # 例：labels_to_array=[1, 1, 5, 10] -> self.labels=array([0, 0, 2, 3])
+        # self.labels 后面由 __len__、__getitem__ 和类别计数逻辑直接使用
+        self.labels = np.array(
+            [labels_to_index[label] for label in labels_to_array]
+        )
+
+        # 保存反向映射：新标签下标 -> 原始标签
+        # 例：new_to_orig_label={0:1, 1:2, 2:5, 3:10}，需要恢复原始类别编号时可以查表
+        # 注意：标签映射是在当前划分内独立建立的；若不同划分缺少不同类别，映射可能不一致
+        # 当前 CUB train/test 各自都有完整 200 类，所以二者映射一致，都是 0~199 -> 1~200
+        self.new_to_orig_label = {
+            i: label for i, label in enumerate(np.unique(labels_to_array))
+        }
+
+        # ======================================
+        # 整理当前划分对应的“可见部件”标注，仅供后续部件可解释性评估使用
+        # ======================================
+
+        # image_parts 是完整 part_locs.txt 表，每行是一条部件标注：<图片id, 部件id, x, y, visible>
+        # image_parts['id'].isin(self.ids)：逐行判断该部件所属图片是否位于当前 train/val/test 划分
+        # .loc[...]：只保留当前划分图片的部件记录
         image_parts = image_parts.loc[image_parts['id'].isin(self.ids)]
+
+        # 再只保留 visible==1 的部件；被遮挡或未标出的部件不参与可见部件评估
+        # self.parts 仍是 pandas DataFrame，列为 id / part_id / x / y / visible
+        # CUB 完整 part_locs.txt 有 176820 条记录，其中 141407 条 visible==1
         self.parts = image_parts[image_parts['visible'] == 1]
-        # 类别总数(CUB=200)
+
+        # ======================================
+        # 统计当前划分的类别总数，以及每个类别包含的图片数量
+        # ======================================
+
+        # self.labels 已经是 0 起连续标签；取唯一值个数即可得到当前划分的类别数
+        # 当前 CUB train/test 各自都包含 200 类，所以 self.num_classes=200
         self.num_classes = len(np.unique(self.labels))
-        # 统计每个类有多少张图，存成 cls_num_list(类平衡采样/加权时会用到，本次默认不用)
+
+        # defaultdict(int) 中不存在的键默认值为 0，适合逐样本累加类别数量
+        # 例：首次执行 self.per_class_count[3] += 1 时，会从默认值 0 加到 1
         self.per_class_count = defaultdict(int)
+
+        # 遍历当前划分每张图的新标签，统计每个类别有多少张图
+        # 结果形式类似：{0: 30, 1: 30, ..., 199: 30}；实际每类数量可能不同
         for label in self.labels:
             self.per_class_count[label] += 1
+
+        # 按类别下标 0, 1, ..., num_classes-1 的固定顺序，把字典整理成列表
+        # 例：per_class_count={0:30, 1:28, 2:31} -> cls_num_list=[30, 28, 31]
+        # 该列表可供类别平衡采样或损失加权使用；本次默认训练流程不使用它
         self.cls_num_list = [self.per_class_count[idx] for idx in range(self.num_classes)]
 
     # 数据集大小 = 样本数
     def __len__(self):
         return len(self.labels)
 
-    # 按下标取一条样本：返回(增强后的图张量, 标签整数)
+    # ======================================
+    # 按位置下标读取一条样本；DataLoader 会反复调用该函数，再把多条样本拼成一个 batch
+    # 返回值为 (图片, 标签)：配置 transform 时图片是 [3,H,W] Tensor，否则仍是 RGB PIL.Image
+    # ======================================
     def __getitem__(self, idx):
-        # 拼出图片完整路径：根目录 / 图片子目录 / 文件名
+        # idx 表示当前划分内部的“样本位置”，不是 CUB 图片 id
+        # 例：idx=0 表示取 self.names[0] 和 self.labels[0]；DataLoader shuffle 只会改变传入 idx 的顺序
+
+        # self.names[idx] 是图片相对于图片目录的路径，例如：
+        # 001.Black_footed_Albatross/Black_Footed_Albatross_0009_34.jpg
+        # os.path.join 把“数据集根目录 / 图片子目录 / 相对文件名”拼成可直接读取的完整路径
         image_path = os.path.join(self.data_path, self.image_sub_path, self.names[idx])
-        # 读图(PIL，已转 RGB)
+
+        # 调用 pil_loader 打开图片并统一转成 RGB 三通道 PIL.Image
+        # 转 RGB 可兼容灰度图或带透明通道的图片，并保证后续 ToTensor 得到 [3,H,W]
         im = self.loader(image_path)
-        # 取标签(已是 0 起连续整数)
+
+        # 从与 self.names 相同位置取出该图片的新标签
+        # 标签已经在 __init__ 中重映射为 0, 1, ..., num_classes-1；单样本阶段通常是 numpy 整数
         label = self.labels[idx]
 
-        # 过一遍增强流水线(训练=强增强，测试=弱增强) -> 得到 [3, H, W] 张量
+        # 若构造 Dataset 时传入了 transform，就对 PIL 图片执行对应的数据变换流水线
+        # train 模式使用随机强增强；test/val 模式使用确定性的弱增强
+        # 本次 image_size=518，流水线最终会执行 ToTensor + Normalize，得到 [3,518,518] Tensor
+        # 若 self.transform=None，则跳过该分支，im 保持为 RGB PIL.Image
         if self.transform:
             im = self.transform(im)
 
+        # 返回一条样本；DataLoader 默认 collate 会把多条图片堆成 [B,3,H,W] Tensor，
+        # 并把多个标签整理成形状 [B] 的整数 Tensor，再交给训练/评估循环
         return im, label
 
     # —— 仅评估用：返回第 idx 张图里所有“可见”的部件 id —— 训练流程不调用

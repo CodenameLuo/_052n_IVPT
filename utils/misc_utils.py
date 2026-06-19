@@ -150,6 +150,7 @@ def check_snapshot(args):
     :param args: Arguments from the argument parser
     :return:
     """
+
     # Check if it is an array training job (i.e. training with multiple random seeds on the same settings)
     # 多种子批量作业(本次 False)：给每个种子单独建一个子目录
     if args.array_training_job and not args.resume_training:

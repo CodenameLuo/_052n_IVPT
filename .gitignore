@@ -40,6 +40,7 @@ _ext/
 wandb/
 exps/
 snapshot/
+snapshot_tmp/
 results_vis_*/
 results_hie_*/
 *.log

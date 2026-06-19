@@ -20,51 +20,51 @@ from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.data import create_transform
 
-
 # ======================================
 
 # 训练用的增强流水线(cub_original)：强增强，每个 epoch、每张图都重新随机一次
 def make_train_transforms(args):
-    train_transforms: Compose = transforms.Compose([
-        # 把短边缩放到 image_size(本次 518)，长边按比例缩放(保持长宽比)
-        transforms.Resize(size=args.image_size, antialias=True),
-        # 以 hflip 概率(默认 0.5)做水平翻转
-        transforms.RandomHorizontalFlip(p=args.hflip),
-        # 以 vflip 概率(默认 0.0，相当于不翻)做垂直翻转
-        transforms.RandomVerticalFlip(p=args.vflip),
-        # 颜色抖动(亮度/对比度/饱和度，用 torchvision 默认幅度)
-        transforms.ColorJitter(),
-        # 随机仿射：旋转 ±90°、平移 ±20%、缩放 0.8~1.2 倍(空出来的区域默认填黑)
-        # 注：这里的 90 / 0.2 / 0.8,1.2 是写死的，不读 args；旋转范围相当大，对细粒度任务算激进
-        transforms.RandomAffine(degrees=90, translate=(0.2, 0.2), scale=(0.8, 1.2)),
-        # 从上面结果里随机裁出 image_size×image_size(本次 518×518)的方图，作为最终输入尺寸
-        transforms.RandomCrop(args.image_size),
-        # PIL 图 -> [0,1] 的 [C,H,W] 张量
-        transforms.ToTensor(),
-        # 按 ImageNet 均值/方差做标准化((x-mean)/std)
-        transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
-
-    ])
+    train_transforms = transforms.Compose(
+        [
+            # 把短边缩放到 image_size(本次 518)，长边按比例缩放(保持长宽比)
+            transforms.Resize(size=args.image_size, antialias=True),
+            # 以 hflip 概率(默认 0.5)做水平翻转
+            transforms.RandomHorizontalFlip(p=args.hflip),
+            # 以 vflip 概率(默认 0.0，相当于不翻)做垂直翻转
+            transforms.RandomVerticalFlip(p=args.vflip),
+            # 颜色抖动(亮度/对比度/饱和度，用 torchvision 默认幅度)
+            transforms.ColorJitter(),
+            # 随机仿射：旋转 ±90°、平移 ±20%、缩放 0.8~1.2 倍(空出来的区域默认填黑)
+            # 注：这里的 90 / 0.2 / 0.8,1.2 是写死的，不读 args；旋转范围相当大，对细粒度任务算激进
+            transforms.RandomAffine(degrees=90, translate=(0.2, 0.2), scale=(0.8, 1.2)),
+            # 从上面结果里随机裁出 image_size×image_size(本次 518×518)的方图，作为最终输入尺寸
+            transforms.RandomCrop(args.image_size),
+            # PIL 图 -> [0,1] 的 [C,H,W] 张量
+            transforms.ToTensor(),
+            # 按 ImageNet 均值/方差做标准化((x-mean)/std)
+            transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
+        ]
+    )
     return train_transforms
-
 
 # ======================================
 
 # 测试/评估用的增强流水线：弱增强、无随机性(保证评估结果可复现、不丢判别性区域)
 def make_test_transforms(args):
-    test_transforms: Compose = transforms.Compose([
-        # 短边缩放到 image_size(本次 518)
-        transforms.Resize(size=args.image_size, antialias=True),
-        # 从中心裁出 image_size×image_size 的方图(没有随机裁剪)
-        transforms.CenterCrop(args.image_size),
-        # PIL 图 -> [0,1] 张量
-        transforms.ToTensor(),
-        # ImageNet 标准化
-        transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
+    test_transforms: Compose = transforms.Compose(
+        [
+            # 短边缩放到 image_size(本次 518)
+            transforms.Resize(size=args.image_size, antialias=True),
+            # 从中心裁出 image_size×image_size 的方图(没有随机裁剪)
+            transforms.CenterCrop(args.image_size),
+            # PIL 图 -> [0,1] 张量
+            transforms.ToTensor(),
+            # ImageNet 标准化
+            transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
+        ]
+    )
 
-    ])
     return test_transforms
-
 
 # ======================================
 
@@ -167,6 +167,7 @@ def inverse_normalize_w_resize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_
 # 总入口(train_net.py 第 4 步调用)：根据 augmentations_to_use 选用哪套训练增强，返回(训练增强, 测试增强)
 def load_transforms(args):
     # Get the transforms and load the dataset
+
     # timm：用 timm 自动增强
     if args.augmentations_to_use == 'timm':
         train_transforms = build_transform_timm(args, is_train=True)
@@ -175,6 +176,8 @@ def load_transforms(args):
         train_transforms = make_train_transforms(args)
     else:
         raise ValueError('Augmentations not supported.')
+
     # 测试增强始终用确定性的 make_test_transforms
     test_transforms = make_test_transforms(args)
+
     return train_transforms, test_transforms
